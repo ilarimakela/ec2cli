@@ -38,7 +38,7 @@ AWS options:
 
 Other options:
 --columns|Columns to show as comma separated list.
- |Default is "name,instanceid,instancetype" and "all" meens all columns
+ |Default is "name,instanceid,state,publicdns" and "all" meens all columns
 
 EOF
 
@@ -70,7 +70,7 @@ Examples:
 EOF
 }
 
-COLUMNS="name,instanceid,instancetype"
+COLUMNS="name,instanceid,state,publicdns"
 SEARCH=()
 
 while [[ $# > 0 ]]
@@ -91,7 +91,7 @@ do
         --sort)
             SORT=$2
             shift;;
-        --columns)
+        --columns|--column)
             COLUMNS=$2
             shift;;
         *)
@@ -142,6 +142,8 @@ function parseInstanceFiles {
             instance+=( "$(echo -e "INSTANCEID\t$ID")" )
             # type
             instance+=( "$(echo "$line" | awk -F"\t" '{print "INSTANCETYPE\t" $9}')" )
+            # public dns
+            instance+=( "$(echo "$line" | grep -o 'ec2-[^[:blank:]]*amazonaws.com' | awk '{print "publicdns\t" $1}')" )
 
             ( IFS=$'\n'; echo "${instance[*]}" > "$TEMP/$ID")
         done
