@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+
+SCRIPT=$0
+
+# Check if user has awscli installed
+if ! hash aws 2>/dev/null 
+then
+    cat << 'EOF'
+Install AWS Command Line tool first from http://aws.amazon.com/cli/
+
+If you have brew installed just run 
+    brew install awscli
+or install brew first http://brew.sh/
+    ruby -e '$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)'
+
+EOF
+    exit 1
+fi
+
+TEMP=`mktemp -d /tmp/ec2cliXXXXX` || (echo "Unable to create temporary directory to /tmp" >&2 && exit 1)
+function clean_up {
+    rm -rf $TEMP 2>/dev/null
+    exit
+}
+trap clean_up SIGINT SIGTERM
+
+function helptext {
+    cat <<EOF
+Usage: $SCRIPT [OPTIONS] [pattern]
+
+List and search AWS instances
+
+EOF
+    cat <<EOF | column -t -s "|"
+AWS options:
+--profile|Use a specific profile from your credential file
+--region|Region to use
+
+Other options:
+--columns|Columns to show as comma separated list.
+ |Default is "name,instanceid,instancetype" and "all" meens all columns
+
+EOF
+
+    cat <<EOF
+
+Pattern is regular expression which you could use to find instances.
+You could use multiple keywords to limit results.
+
+Examples:
+    To find all instances and default columns to shown
+
+        $ $SCRIPT
+
+    To find instance i-123abc99 and see is it runnning
+
+        $ $SCRIPT --columns running i-123abc99
+
+    To find all instances which has name tag and are running in eu-central-1
+
+        $ $SCRIPT --columns name,instanceid name running eu-central-1
+
+    To find running t2.micro instances which are part of opsworks stack
+
+        $ $SCRIPT --columns name,ami,status running t2.micro opsworks:stack
+
+    To find all running instances
+
+        $ $SCRIPT running
+EOF
+}
+
+COLUMNS="name,instanceid,instancetype"
+SEARCH=()
+
+while [[ $# > 0 ]]
+do
+    case "$1" in
+        --help|-h)
+            helptext
+            exit 1;;
+        --profile)
+            PROFILE="--profile $2"
+            shift;;
+        --region)
+            REGION="--region $2"
+            shift;;
+        --instances)
+            INSTANCES=$2
+            shift;;
+        --sort)
+            SORT=$2
+            shift;;
+        --columns)
+            COLUMNS=$2
+            shift;;
+        *)
+            SEARCH+=($1)
+            ;;
+    esac
+
+    shift
+done
+
+function parseOutputFromAwscli {
+    parseRawOutputToInstances
+    parseInstanceFiles
+}
+
+function parseRawOutputToInstances {
+    LINENUMBERS=$(cat $TEMP/output | grep -n RESERVATIONS | awk -F: '{print $1}' | sort -r -n)
+
+    for LINE in $LINENUMBERS
+    do
+        END=$(wc -l $TEMP/output | awk '{print $1}')
+        sed -n $LINE,"$END"p $TEMP/output > $TEMP/current
+        cp $TEMP/current $TEMP/$(egrep '^RESERVATIONS' $TEMP/current | awk '{print $NF}') 
+        # Delete processed lines
+        sed -i '' $LINE,"$END"d $TEMP/output
+    done
+
+    rm -rf $TEMP/{current,output} 2>/dev/null
+}
+
+function parseInstanceFiles {
+    for FILE in $TEMP/r-*
+    do
+        meta=()
+        meta+=( "$(egrep '^STATE\t' $FILE | awk '{print $1 "\t" $3}')" )
+        meta+=( "$(egrep '^MONITORING' $FILE | awk '{print $1 "\t" $2}')" )
+        meta+=( "$(egrep '^PLACEMENT' $FILE | awk '{print $1 "\t" $2}')" )
+        meta+=( "$(egrep '^SECURITYGROUPS' $FILE | awk '{print $1 "\t" $3}')" )
+        meta+=( "$(egrep '^TAGS' $FILE )" )
+
+        egrep '^INSTANCES' $FILE | while IFS='' read -r line
+        do
+            instance=( "${meta[@]}" )
+            # AMI
+            instance+=( "$(echo "$line" | awk -F"\t" '{print "AMI\t" $7}')" )
+            # instanceID
+            ID="$(echo "$line" | awk -F"\t" '{print $8}')"
+            instance+=( "$(echo -e "INSTANCEID\t$ID")" )
+            # type
+            instance+=( "$(echo "$line" | awk -F"\t" '{print "INSTANCETYPE\t" $9}')" )
+
+            ( IFS=$'\n'; echo "${instance[*]}" > "$TEMP/$ID")
+        done
+
+        rm -f $FILE 2>/dev/null
+    done
+}
+
+function doSearch {
+    [ ${#SEARCH[@]} -eq 0 ] && return
+
+    for KEY in ${SEARCH[@]}
+    do
+        # Find matching files
+        FOUND="$(find "$TEMP" ! -type d -exec egrep -l "$KEY" {} \;)"
+
+        if [ -z "$FOUND" ]
+        then
+            rm -f "$TEMP"/*
+        else
+            # Remove files which doesn't contain the keyword
+            find "$TEMP" ! -type d | grep -v "$FOUND" | xargs rm -f > /dev/null
+        fi
+    done
+}
+
+function removeUnneededColumns {
+    COLS="$(echo "$COLUMNS" | tr ',' '|')"
+    
+    [ -z "$(ls "$TEMP")" ] && return
+
+    for FILE in $TEMP/*
+    do
+        # Remove TAGS and replace it with tags key
+        # Then you could use tag keys as columns
+        sed -i '' -E $'s/^TAGS\t//g' "$FILE"
+
+        if [ "$COLUMNS" != 'all' ]
+        then
+            egrep -i "^($COLS)" "$FILE" > "$TEMP/current"
+            mv "$TEMP/current" "$FILE"
+        fi
+    done
+}
+
+function makePrettyOutput {
+    [ -z "$(ls "$TEMP")" ] && return
+
+    OUTPUT="$TEMP/output"
+
+    # Make heading for table
+    if [ "$COLUMNS" = 'all' ]
+    then
+        COLUMNS="$(cat "$TEMP"/i-* | awk '{print $1}' | sort -u | tr '\n' ',')"
+    fi
+
+    echo $COLUMNS | tr ',' "\t" > $OUTPUT
+
+    for FILE in $TEMP/i-*
+    do
+        LINE=
+        for COL in $(echo $COLUMNS | tr ',' "\t")
+        do
+            FIELD="$(egrep -i "^($COL)" "$FILE" | awk '{$1=""; print $0}' | sed 's/^ //' | tr -d '\n')"
+            if [ -n "$FIELD" ]
+            then
+                LINE+="$FIELD"
+            else
+                LINE+=" "
+            fi
+            LINE+="\t"
+        done
+
+        echo -e "$LINE" >> $OUTPUT
+    done
+
+    cat $OUTPUT | column -ts $'\t'
+}
+
+
+AWS=$(aws $PROFILE $REGION --output text ec2 describe-instances > $TEMP/output)
+RETURN=$?
+
+if [ $RETURN -ne 0 ]
+then
+    echo "$AWS" >&2
+    exit $RETURN
+fi
+parseOutputFromAwscli
+doSearch
+removeUnneededColumns
+makePrettyOutput
+
+clean_up
+
